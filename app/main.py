@@ -3,22 +3,29 @@ import json
 import os
 import secrets
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import httpx
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="FlipAI API", version="1.5.0")
+app = FastAPI(title="FlipAI API", version="1.6.0")
 
 PUBLIC_API_KEY = os.environ["FLIPAI_PUBLIC_API_KEY"]
 INTERNAL_API_KEY = os.environ["FLIPAI_INTERNAL_API_KEY"]
+JWT_SECRET = os.environ.get("FLIPAI_JWT_SECRET", "")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080/v1/chat/completions")
 MODEL_ALIAS = os.environ.get("FLIPAI_MODEL_ALIAS", "flipai-v1")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://flipai:flipai@127.0.0.1:5432/flipai")
 MEMORY_LIMIT = int(os.environ.get("FLIPAI_MEMORY_LIMIT", "20"))
 STARTING_CREDITS = int(os.environ.get("FLIPAI_STARTING_CREDITS", "5000"))
 REQUESTS_PER_MINUTE = int(os.environ.get("FLIPAI_REQUESTS_PER_MINUTE", "20"))
+ACCESS_TOKEN_MINUTES = int(os.environ.get("FLIPAI_ACCESS_TOKEN_MINUTES", "15"))
+REFRESH_TOKEN_DAYS = int(os.environ.get("FLIPAI_REFRESH_TOKEN_DAYS", "30"))
 
 SYSTEM_PROMPT = """You are FlipAI, a fast, practical and helpful AI assistant.
 Answer in the same language as the user unless they request otherwise.
@@ -27,9 +34,10 @@ Do not claim capabilities you do not have.
 """
 
 pool: asyncpg.Pool | None = None
+password_hasher = PasswordHasher()
 
 
-def hash_key(value: str) -> str:
+def hash_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -48,43 +56,104 @@ def parse_uuid(value: str, field: str) -> uuid.UUID:
         raise HTTPException(status_code=400, detail=f"Invalid {field}")
 
 
+def normalize_email(value: str) -> str:
+    email = value.strip().lower()
+    if len(email) > 254 or "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    return email
+
+
+def validate_password(value: str):
+    if len(value) < 8 or len(value) > 128:
+        raise HTTPException(status_code=400, detail="Password must be 8-128 characters")
+
+
+def require_jwt_secret():
+    if len(JWT_SECRET) < 32:
+        raise HTTPException(status_code=503, detail="JWT authentication is not configured")
+
+
+def create_access_token(user_id: uuid.UUID) -> tuple[str, int]:
+    require_jwt_secret()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=ACCESS_TOKEN_MINUTES)
+    token = jwt.encode(
+        {"sub": str(user_id), "type": "access", "iat": int(now.timestamp()), "exp": int(expires.timestamp())},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return token, int((expires - now).total_seconds())
+
+
+async def create_refresh_session(user_id: uuid.UUID) -> str:
+    raw = "flipai_refresh_" + secrets.token_hex(48)
+    expires = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO refresh_tokens(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)",
+            uuid.uuid4(), user_id, hash_value(raw), expires,
+        )
+    return raw
+
+
+async def issue_tokens(user_id: uuid.UUID) -> dict:
+    access, expires_in = create_access_token(user_id)
+    refresh = await create_refresh_session(user_id)
+    return {
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+    }
+
+
+async def auth_user_row(user_id: uuid.UUID):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id,name,email,credits,is_active FROM users WHERE id=$1", user_id)
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    if not row["is_active"]:
+        raise HTTPException(status_code=403, detail="User account disabled")
+    return row
+
+
 async def authenticate(authorization: str | None) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing API key")
-
+        raise HTTPException(status_code=401, detail="Missing authorization token")
     token = authorization.removeprefix("Bearer ").strip()
     if token == PUBLIC_API_KEY:
-        return {"type": "admin", "user_id": None, "name": "admin", "key_id": None}
-
+        return {"type": "admin", "user_id": None, "name": "admin", "key_id": None, "auth_method": "admin_key"}
     if pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    token_hash = hash_key(token)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT u.id, u.name, u.credits, u.is_active, k.id AS key_id
-            FROM api_keys k
-            JOIN users u ON u.id=k.user_id
-            WHERE k.api_key_hash=$1 AND k.is_active=TRUE
-            """,
-            token_hash,
-        )
-        if row:
-            await conn.execute("UPDATE api_keys SET last_used_at=NOW() WHERE id=$1", row["key_id"])
+    if token.startswith("flipai_user_"):
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT u.id,u.name,u.email,u.credits,u.is_active,k.id AS key_id
+                FROM api_keys k JOIN users u ON u.id=k.user_id
+                WHERE k.api_key_hash=$1 AND k.is_active=TRUE
+                """,
+                hash_value(token),
+            )
+            if row:
+                await conn.execute("UPDATE api_keys SET last_used_at=NOW() WHERE id=$1", row["key_id"])
+        if not row:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        if not row["is_active"]:
+            raise HTTPException(status_code=403, detail="User account disabled")
+        return {"type": "user", "user_id": row["id"], "name": row["name"], "email": row["email"], "credits": row["credits"], "key_id": row["key_id"], "auth_method": "api_key"}
 
-    if not row:
-        raise HTTPException(status_code=401, detail="Invalid or revoked API key")
-    if not row["is_active"]:
-        raise HTTPException(status_code=403, detail="User account disabled")
-
-    return {
-        "type": "user",
-        "user_id": row["id"],
-        "name": row["name"],
-        "credits": row["credits"],
-        "key_id": row["key_id"],
-    }
+    require_jwt_secret()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "access":
+            raise jwt.InvalidTokenError()
+        uid = uuid.UUID(payload["sub"])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, KeyError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    row = await auth_user_row(uid)
+    return {"type": "user", "user_id": row["id"], "name": row["name"], "email": row["email"], "credits": row["credits"], "key_id": None, "auth_method": "jwt"}
 
 
 def require_admin(auth: dict):
@@ -94,7 +163,7 @@ def require_admin(auth: dict):
 
 def require_user(auth: dict):
     if auth["type"] != "user":
-        raise HTTPException(status_code=400, detail="User API key required")
+        raise HTTPException(status_code=400, detail="User authentication required")
 
 
 @app.on_event("startup")
@@ -106,12 +175,16 @@ async def startup():
             CREATE TABLE IF NOT EXISTS users (
                 id UUID PRIMARY KEY,
                 name TEXT NOT NULL,
-                api_key_hash TEXT NOT NULL UNIQUE,
+                api_key_hash TEXT UNIQUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute("ALTER TABLE users ALTER COLUMN api_key_hash DROP NOT NULL")
         await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS credits BIGINT NOT NULL DEFAULT {STARTING_CREDITS}")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(LOWER(email)) WHERE email IS NOT NULL")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -127,12 +200,22 @@ async def startup():
             )
         """)
         await conn.execute("""
-            INSERT INTO api_keys(id, user_id, name, key_prefix, api_key_hash)
-            SELECT gen_random_uuid(), u.id, 'Legacy key', 'legacy', u.api_key_hash
+            INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash)
+            SELECT gen_random_uuid(),u.id,'Legacy key','legacy',u.api_key_hash
             FROM users u
-            WHERE NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.api_key_hash=u.api_key_hash)
+            WHERE u.api_key_hash IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.api_key_hash=u.api_key_hash)
         """)
-
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                revoked_at TIMESTAMPTZ
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id UUID PRIMARY KEY,
@@ -142,7 +225,6 @@ async def startup():
         """)
         await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE")
         await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT 'New chat'")
-
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id BIGSERIAL PRIMARY KEY,
@@ -171,11 +253,12 @@ async def startup():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id, id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_events(user_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_created ON request_events(user_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id,id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id,updated_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_events(user_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_created ON request_events(user_id,created_at DESC)")
 
 
 @app.on_event("shutdown")
@@ -193,8 +276,97 @@ async def health():
             async with pool.acquire() as conn:
                 db_ok = await conn.fetchval("SELECT 1") == 1
         except Exception:
-            db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "service": "flipai-api", "model": MODEL_ALIAS, "database": db_ok, "version": "1.5.0"}
+            pass
+    return {"status": "ok" if db_ok else "degraded", "service": "flipai-api", "model": MODEL_ALIAS, "database": db_ok, "version": "1.6.0", "jwt_configured": len(JWT_SECRET) >= 32}
+
+
+@app.post("/v1/auth/register")
+async def register(request: Request):
+    require_jwt_secret()
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()[:100]
+    email = normalize_email(str(payload.get("email", "")))
+    password = str(payload.get("password", ""))
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    validate_password(password)
+    uid = uuid.uuid4()
+    password_hash = password_hasher.hash(password)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users(id,name,email,password_hash,credits,is_active) VALUES($1,$2,$3,$4,$5,TRUE)",
+                uid, name, email, password_hash, STARTING_CREDITS,
+            )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    tokens = await issue_tokens(uid)
+    return {"user": {"id": str(uid), "name": name, "email": email, "credits": STARTING_CREDITS}, **tokens}
+
+
+@app.post("/v1/auth/login")
+async def login(request: Request):
+    require_jwt_secret()
+    payload = await request.json()
+    email = normalize_email(str(payload.get("email", "")))
+    password = str(payload.get("password", ""))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id,name,email,password_hash,credits,is_active FROM users WHERE LOWER(email)=LOWER($1)", email)
+    if not row or not row["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    try:
+        password_hasher.verify(row["password_hash"], password)
+    except VerifyMismatchError:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not row["is_active"]:
+        raise HTTPException(status_code=403, detail="User account disabled")
+    if password_hasher.check_needs_rehash(row["password_hash"]):
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE users SET password_hash=$2 WHERE id=$1", row["id"], password_hasher.hash(password))
+    tokens = await issue_tokens(row["id"])
+    return {"user": {"id": str(row["id"]), "name": row["name"], "email": row["email"], "credits": row["credits"]}, **tokens}
+
+
+@app.post("/v1/auth/refresh")
+async def refresh(request: Request):
+    require_jwt_secret()
+    payload = await request.json()
+    refresh_token = str(payload.get("refresh_token", ""))
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token is required")
+    token_hash = hash_value(refresh_token)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id,user_id,expires_at,revoked_at FROM refresh_tokens WHERE token_hash=$1 FOR UPDATE",
+                token_hash,
+            )
+            if not row or row["revoked_at"] or row["expires_at"] <= datetime.now(timezone.utc):
+                raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+            user = await conn.fetchrow("SELECT id,is_active FROM users WHERE id=$1", row["user_id"])
+            if not user or not user["is_active"]:
+                raise HTTPException(status_code=403, detail="User account disabled")
+            await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1", row["id"])
+    return await issue_tokens(row["user_id"])
+
+
+@app.post("/v1/auth/logout")
+async def logout(request: Request):
+    payload = await request.json()
+    refresh_token = str(payload.get("refresh_token", ""))
+    if refresh_token:
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE token_hash=$1 AND revoked_at IS NULL", hash_value(refresh_token))
+    return {"logged_out": True}
+
+
+@app.get("/v1/account/me")
+async def account_me(authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    require_user(auth)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id,name,email,credits,is_active,created_at FROM users WHERE id=$1", auth["user_id"])
+    return {"id": str(row["id"]), "name": row["name"], "email": row["email"], "credits": row["credits"], "enabled": row["is_active"], "auth_method": auth["auth_method"], "created_at": row["created_at"].isoformat()}
 
 
 @app.get("/v1/models")
@@ -215,22 +387,15 @@ async def create_user(request: Request, authorization: str | None = Header(defau
         credits = max(0, int(payload.get("credits", STARTING_CREDITS)))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="credits must be an integer")
-
-    user_id = uuid.uuid4()
+    uid = uuid.uuid4()
     raw_key = make_user_key()
-    kh = hash_key(raw_key)
+    kh = hash_value(raw_key)
     kid = uuid.uuid4()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                "INSERT INTO users(id, name, api_key_hash, credits, is_active) VALUES($1,$2,$3,$4,TRUE)",
-                user_id, name, kh, credits,
-            )
-            await conn.execute(
-                "INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)",
-                kid, user_id, "Default key", key_prefix(raw_key), kh,
-            )
-    return {"id": str(user_id), "name": name, "credits": credits, "enabled": True, "api_key": raw_key, "api_key_id": str(kid)}
+            await conn.execute("INSERT INTO users(id,name,api_key_hash,credits,is_active) VALUES($1,$2,$3,$4,TRUE)", uid, name, kh, credits)
+            await conn.execute("INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)", kid, uid, "Default key", key_prefix(raw_key), kh)
+    return {"id": str(uid), "name": name, "credits": credits, "enabled": True, "api_key": raw_key, "api_key_id": str(kid)}
 
 
 @app.get("/v1/admin/users")
@@ -238,8 +403,8 @@ async def list_users(authorization: str | None = Header(default=None)):
     auth = await authenticate(authorization)
     require_admin(auth)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id,name,credits,is_active,created_at FROM users ORDER BY created_at DESC")
-    return {"data": [{"id": str(r["id"]), "name": r["name"], "credits": r["credits"], "enabled": r["is_active"], "created_at": r["created_at"].isoformat()} for r in rows]}
+        rows = await conn.fetch("SELECT id,name,email,credits,is_active,created_at FROM users ORDER BY created_at DESC")
+    return {"data": [{"id": str(r["id"]), "name": r["name"], "email": r["email"], "credits": r["credits"], "enabled": r["is_active"], "created_at": r["created_at"].isoformat()} for r in rows]}
 
 
 @app.post("/v1/admin/users/{user_id}/disable")
@@ -249,6 +414,8 @@ async def disable_user(user_id: str, authorization: str | None = Header(default=
     uid = parse_uuid(user_id, "user_id")
     async with pool.acquire() as conn:
         row = await conn.fetchrow("UPDATE users SET is_active=FALSE WHERE id=$1 RETURNING id,name", uid)
+        if row:
+            await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", uid)
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     return {"id": str(uid), "name": row["name"], "enabled": False}
@@ -290,10 +457,7 @@ async def list_api_keys(authorization: str | None = Header(default=None)):
     auth = await authenticate(authorization)
     require_user(auth)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id,name,key_prefix,is_active,created_at,last_used_at,revoked_at FROM api_keys WHERE user_id=$1 ORDER BY created_at DESC",
-            auth["user_id"],
-        )
+        rows = await conn.fetch("SELECT id,name,key_prefix,is_active,created_at,last_used_at,revoked_at FROM api_keys WHERE user_id=$1 ORDER BY created_at DESC", auth["user_id"])
     return {"data": [{"id": str(r["id"]), "name": r["name"], "prefix": r["key_prefix"], "active": r["is_active"], "created_at": r["created_at"].isoformat(), "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None, "revoked_at": r["revoked_at"].isoformat() if r["revoked_at"] else None} for r in rows]}
 
 
@@ -306,10 +470,7 @@ async def create_api_key(request: Request, authorization: str | None = Header(de
     raw_key = make_user_key()
     kid = uuid.uuid4()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)",
-            kid, auth["user_id"], name, key_prefix(raw_key), hash_key(raw_key),
-        )
+        await conn.execute("INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)", kid, auth["user_id"], name, key_prefix(raw_key), hash_value(raw_key))
     return {"id": str(kid), "name": name, "api_key": raw_key}
 
 
@@ -319,10 +480,7 @@ async def revoke_api_key(key_id: str, authorization: str | None = Header(default
     require_user(auth)
     kid = parse_uuid(key_id, "key_id")
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE api_keys SET is_active=FALSE, revoked_at=NOW() WHERE id=$1 AND user_id=$2 AND is_active=TRUE RETURNING id",
-            kid, auth["user_id"],
-        )
+        row = await conn.fetchrow("UPDATE api_keys SET is_active=FALSE,revoked_at=NOW() WHERE id=$1 AND user_id=$2 AND is_active=TRUE RETURNING id", kid, auth["user_id"])
     if not row:
         raise HTTPException(status_code=404, detail="Active API key not found")
     return {"revoked": True, "id": str(kid)}
@@ -340,11 +498,8 @@ async def rotate_api_key(key_id: str, authorization: str | None = Header(default
             old = await conn.fetchrow("SELECT name FROM api_keys WHERE id=$1 AND user_id=$2 AND is_active=TRUE FOR UPDATE", old_id, auth["user_id"])
             if not old:
                 raise HTTPException(status_code=404, detail="Active API key not found")
-            await conn.execute("UPDATE api_keys SET is_active=FALSE, revoked_at=NOW() WHERE id=$1", old_id)
-            await conn.execute(
-                "INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)",
-                new_id, auth["user_id"], old["name"], key_prefix(new_key), hash_key(new_key),
-            )
+            await conn.execute("UPDATE api_keys SET is_active=FALSE,revoked_at=NOW() WHERE id=$1", old_id)
+            await conn.execute("INSERT INTO api_keys(id,user_id,name,key_prefix,api_key_hash) VALUES($1,$2,$3,$4,$5)", new_id, auth["user_id"], old["name"], key_prefix(new_key), hash_value(new_key))
     return {"rotated": True, "old_key_id": str(old_id), "id": str(new_id), "api_key": new_key}
 
 
@@ -363,18 +518,8 @@ async def account_usage(authorization: str | None = Header(default=None)):
     auth = await authenticate(authorization)
     require_user(auth)
     async with pool.acquire() as conn:
-        totals = await conn.fetchrow("""
-            SELECT COALESCE(SUM(prompt_tokens),0)::BIGINT AS prompt_tokens,
-                   COALESCE(SUM(completion_tokens),0)::BIGINT AS completion_tokens,
-                   COALESCE(SUM(total_tokens),0)::BIGINT AS total_tokens,
-                   COALESCE(SUM(credits_used),0)::BIGINT AS credits_used,
-                   COUNT(*)::BIGINT AS requests
-            FROM usage_events WHERE user_id=$1
-        """, auth["user_id"])
-        recent = await conn.fetch("""
-            SELECT conversation_id,prompt_tokens,completion_tokens,total_tokens,credits_used,created_at
-            FROM usage_events WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20
-        """, auth["user_id"])
+        totals = await conn.fetchrow("SELECT COALESCE(SUM(prompt_tokens),0)::BIGINT AS prompt_tokens,COALESCE(SUM(completion_tokens),0)::BIGINT AS completion_tokens,COALESCE(SUM(total_tokens),0)::BIGINT AS total_tokens,COALESCE(SUM(credits_used),0)::BIGINT AS credits_used,COUNT(*)::BIGINT AS requests FROM usage_events WHERE user_id=$1", auth["user_id"])
+        recent = await conn.fetch("SELECT conversation_id,prompt_tokens,completion_tokens,total_tokens,credits_used,created_at FROM usage_events WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20", auth["user_id"])
     return {"totals": dict(totals), "recent": [{"conversation_id": str(r["conversation_id"]) if r["conversation_id"] else None, "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"], "total_tokens": r["total_tokens"], "credits_used": r["credits_used"], "created_at": r["created_at"].isoformat()} for r in recent]}
 
 
@@ -382,11 +527,10 @@ async def enforce_rate_limit(auth: dict):
     if auth["type"] == "admin":
         return
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            count = await conn.fetchval("SELECT COUNT(*) FROM request_events WHERE user_id=$1 AND created_at>=NOW()-INTERVAL '1 minute'", auth["user_id"])
-            if count >= REQUESTS_PER_MINUTE:
-                raise HTTPException(status_code=429, detail=f"Rate limit exceeded: {REQUESTS_PER_MINUTE} requests per minute")
-            await conn.execute("INSERT INTO request_events(user_id) VALUES($1)", auth["user_id"])
+        count = await conn.fetchval("SELECT COUNT(*) FROM request_events WHERE user_id=$1 AND created_at>=NOW()-INTERVAL '1 minute'", auth["user_id"])
+        if count >= REQUESTS_PER_MINUTE:
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded: {REQUESTS_PER_MINUTE} requests per minute")
+        await conn.execute("INSERT INTO request_events(user_id) VALUES($1)", auth["user_id"])
 
 
 async def require_credits(auth: dict):
@@ -474,11 +618,7 @@ async def delete_conversation(conversation_id: str, authorization: str | None = 
 
 async def load_history(conversation_id: uuid.UUID) -> list[dict]:
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT role,content FROM (
-                SELECT id,role,content FROM messages WHERE conversation_id=$1 ORDER BY id DESC LIMIT $2
-            ) q ORDER BY id ASC
-        """, conversation_id, MEMORY_LIMIT)
+        rows = await conn.fetch("SELECT role,content FROM (SELECT id,role,content FROM messages WHERE conversation_id=$1 ORDER BY id DESC LIMIT $2) q ORDER BY id ASC", conversation_id, MEMORY_LIMIT)
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
@@ -549,36 +689,25 @@ async def chat(request: Request, authorization: str | None = Header(default=None
     incoming_messages = payload.get("messages")
     if not isinstance(incoming_messages, list) or not incoming_messages:
         raise HTTPException(status_code=400, detail="messages is required")
-
     conversation_id = await ensure_conversation(payload.get("conversation_id"), auth)
     user_text = extract_user_message(incoming_messages)
     history = await load_history(conversation_id)
     await save_message(conversation_id, "user", user_text)
     await maybe_set_title(conversation_id, user_text)
-
     is_stream = bool(payload.get("stream", False))
-    upstream = {
-        "model": MODEL_ALIAS,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_text}],
-        "temperature": payload.get("temperature", 0.7),
-        "max_tokens": payload.get("max_tokens", 512),
-        "stream": is_stream,
-    }
+    upstream = {"model": MODEL_ALIAS, "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_text}], "temperature": payload.get("temperature", 0.7), "max_tokens": payload.get("max_tokens", 512), "stream": is_stream}
     if is_stream:
         upstream["stream_options"] = {"include_usage": True}
         return StreamingResponse(stream_from_llama(upstream, conversation_id, auth), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Conversation-ID": str(conversation_id)})
-
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(LLAMA_URL, json=upstream, headers=upstream_headers())
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Model backend unavailable: {exc}") from exc
-
     try:
         data = response.json()
     except ValueError:
         raise HTTPException(status_code=502, detail="Invalid response from model backend")
-
     if response.status_code < 400:
         try:
             assistant_text = data["choices"][0]["message"]["content"]
@@ -587,6 +716,5 @@ async def chat(request: Request, authorization: str | None = Header(default=None
         except Exception:
             pass
         await record_usage(auth, conversation_id, data.get("usage"))
-
     data["conversation_id"] = str(conversation_id)
     return JSONResponse(content=data, status_code=response.status_code)
