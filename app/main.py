@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import secrets
 import uuid
 
 import asyncpg
@@ -7,7 +9,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="FlipAI API", version="1.2.0")
+app = FastAPI(title="FlipAI API", version="1.3.0")
 
 PUBLIC_API_KEY = os.environ["FLIPAI_PUBLIC_API_KEY"]
 INTERNAL_API_KEY = os.environ["FLIPAI_INTERNAL_API_KEY"]
@@ -25,12 +27,36 @@ Do not claim capabilities you do not have.
 pool: asyncpg.Pool | None = None
 
 
-def require_auth(authorization: str | None):
+def hash_key(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def authenticate(authorization: str | None) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key")
+
     token = authorization.removeprefix("Bearer ").strip()
-    if token != PUBLIC_API_KEY:
+    if token == PUBLIC_API_KEY:
+        return {"type": "admin", "user_id": None, "name": "admin"}
+
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name FROM users WHERE api_key_hash=$1",
+            hash_key(token),
+        )
+
+    if not row:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return {"type": "user", "user_id": row["id"], "name": row["name"]}
+
+
+def require_admin(auth: dict):
+    if auth["type"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin API key required")
 
 
 @app.on_event("startup")
@@ -39,12 +65,22 @@ async def startup():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with pool.acquire() as conn:
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                api_key_hash TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id UUID PRIMARY KEY,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE")
+        await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT 'New chat'")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id BIGSERIAL PRIMARY KEY,
@@ -55,6 +91,7 @@ async def startup():
             )
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id, id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC)")
 
 
 @app.on_event("shutdown")
@@ -73,16 +110,68 @@ async def health():
                 db_ok = await conn.fetchval("SELECT 1") == 1
         except Exception:
             db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "service": "flipai-api", "model": MODEL_ALIAS, "database": db_ok}
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "service": "flipai-api",
+        "model": MODEL_ALIAS,
+        "database": db_ok,
+        "version": "1.3.0",
+    }
 
 
 @app.get("/v1/models")
 async def models(authorization: str | None = Header(default=None)):
-    require_auth(authorization)
+    await authenticate(authorization)
     return {"object": "list", "data": [{"id": MODEL_ALIAS, "object": "model", "owned_by": "flipai"}]}
 
 
-async def ensure_conversation(conversation_id: str | None) -> uuid.UUID:
+@app.post("/v1/admin/users")
+async def create_user(request: Request, authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    require_admin(auth)
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+
+    user_id = uuid.uuid4()
+    raw_key = "flipai_user_" + secrets.token_hex(32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users(id, name, api_key_hash) VALUES($1,$2,$3)",
+            user_id,
+            name,
+            hash_key(raw_key),
+        )
+
+    return {"id": str(user_id), "name": name, "api_key": raw_key}
+
+
+@app.get("/v1/admin/users")
+async def list_users(authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    require_admin(auth)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name, created_at FROM users ORDER BY created_at DESC")
+    return {
+        "data": [
+            {"id": str(r["id"]), "name": r["name"], "created_at": r["created_at"].isoformat()}
+            for r in rows
+        ]
+    }
+
+
+async def check_conversation_access(conversation_id: uuid.UUID, auth: dict):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, user_id, title FROM conversations WHERE id=$1", conversation_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if auth["type"] == "user" and row["user_id"] != auth["user_id"]:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return row
+
+
+async def ensure_conversation(conversation_id: str | None, auth: dict, title: str | None = None) -> uuid.UUID:
     if pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -91,16 +180,96 @@ async def ensure_conversation(conversation_id: str | None) -> uuid.UUID:
             cid = uuid.UUID(conversation_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation_id")
-        async with pool.acquire() as conn:
-            exists = await conn.fetchval("SELECT 1 FROM conversations WHERE id=$1", cid)
-        if not exists:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+        await check_conversation_access(cid, auth)
         return cid
 
     cid = uuid.uuid4()
+    owner = auth["user_id"] if auth["type"] == "user" else None
+    conversation_title = (title or "New chat").strip()[:120] or "New chat"
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO conversations(id) VALUES($1)", cid)
+        await conn.execute(
+            "INSERT INTO conversations(id, user_id, title) VALUES($1,$2,$3)",
+            cid,
+            owner,
+            conversation_title,
+        )
     return cid
+
+
+@app.post("/v1/conversations")
+async def create_conversation(request: Request, authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    payload = await request.json()
+    cid = await ensure_conversation(None, auth, payload.get("title"))
+    return {"id": str(cid), "title": (payload.get("title") or "New chat")[:120]}
+
+
+@app.get("/v1/conversations")
+async def list_conversations(authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    async with pool.acquire() as conn:
+        if auth["type"] == "admin":
+            rows = await conn.fetch(
+                "SELECT id, user_id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, user_id, title, created_at, updated_at FROM conversations WHERE user_id=$1 ORDER BY updated_at DESC LIMIT 100",
+                auth["user_id"],
+            )
+    return {
+        "data": [
+            {
+                "id": str(r["id"]),
+                "user_id": str(r["user_id"]) if r["user_id"] else None,
+                "title": r["title"],
+                "created_at": r["created_at"].isoformat(),
+                "updated_at": r["updated_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/v1/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    try:
+        cid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation_id")
+    row = await check_conversation_access(cid, auth)
+    async with pool.acquire() as conn:
+        messages = await conn.fetch(
+            "SELECT id, role, content, created_at FROM messages WHERE conversation_id=$1 ORDER BY id ASC",
+            cid,
+        )
+    return {
+        "id": str(cid),
+        "title": row["title"],
+        "messages": [
+            {
+                "id": m["id"],
+                "role": m["role"],
+                "content": m["content"],
+                "created_at": m["created_at"].isoformat(),
+            }
+            for m in messages
+        ],
+    }
+
+
+@app.delete("/v1/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    try:
+        cid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation_id")
+    await check_conversation_access(cid, auth)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM conversations WHERE id=$1", cid)
+    return {"deleted": True, "id": str(cid)}
 
 
 async def load_history(conversation_id: uuid.UUID) -> list[dict]:
@@ -136,6 +305,18 @@ async def save_message(conversation_id: uuid.UUID, role: str, content: str):
             content,
         )
         await conn.execute("UPDATE conversations SET updated_at=NOW() WHERE id=$1", conversation_id)
+
+
+async def maybe_set_title(conversation_id: uuid.UUID, user_text: str):
+    title = " ".join(user_text.strip().split())[:60]
+    if not title:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE conversations SET title=$2 WHERE id=$1 AND title='New chat'",
+            conversation_id,
+            title,
+        )
 
 
 def extract_user_message(messages: list[dict]) -> str:
@@ -186,17 +367,18 @@ async def stream_from_llama(upstream: dict, conversation_id: uuid.UUID):
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request, authorization: str | None = Header(default=None)):
-    require_auth(authorization)
+    auth = await authenticate(authorization)
     payload = await request.json()
 
     incoming_messages = payload.get("messages")
     if not isinstance(incoming_messages, list) or not incoming_messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
-    conversation_id = await ensure_conversation(payload.get("conversation_id"))
+    conversation_id = await ensure_conversation(payload.get("conversation_id"), auth)
     user_text = extract_user_message(incoming_messages)
     history = await load_history(conversation_id)
     await save_message(conversation_id, "user", user_text)
+    await maybe_set_title(conversation_id, user_text)
 
     clean_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     clean_messages.extend(history)
