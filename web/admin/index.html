@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FlipAI Admin</title>
+  <link rel="stylesheet" href="/admin/admin.css" />
+</head>
+<body>
+  <div id="loginView" class="login-view">
+    <div class="login-card">
+      <div class="logo">F</div>
+      <h1>FlipAI Admin</h1>
+      <p>Sign in with your administrator email.</p>
+      <form id="loginForm">
+        <label>Email<input id="email" type="email" autocomplete="email" required /></label>
+        <label>Password<input id="password" type="password" autocomplete="current-password" required /></label>
+        <button id="loginBtn" type="submit">Sign in</button>
+      </form>
+      <div id="loginError" class="error"></div>
+    </div>
+  </div>
+
+  <div id="dashboardView" class="dashboard hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo small">F</span><strong>FlipAI Admin</strong></div>
+      <nav>
+        <button class="nav active">Overview</button>
+        <button class="nav" disabled>Users</button>
+        <button class="nav" disabled>Usage</button>
+        <button class="nav" disabled>API Keys</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div id="adminEmail" class="admin-email"></div>
+        <button id="logoutBtn" class="secondary">Log out</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header><div><h1>Overview</h1><p>FlipAI administration dashboard</p></div><span class="status">Admin</span></header>
+      <section class="cards">
+        <article><span>Admin session</span><strong>Active</strong></article>
+        <article><span>API status</span><strong id="apiStatus">Checking…</strong></article>
+        <article><span>Role</span><strong>Administrator</strong></article>
+      </section>
+      <section class="panel">
+        <h2>Admin account</h2>
+        <div class="account-row"><span>Email</span><strong id="accountEmail">—</strong></div>
+        <div class="account-row"><span>Authentication</span><strong>Email + password</strong></div>
+        <div class="account-row"><span>Session</span><strong>JWT admin access token</strong></div>
+      </section>
+      <section class="panel muted-panel">
+        <h2>Next admin module</h2>
+        <p>User management, credits, enable/disable controls and usage statistics will appear here.</p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/admin/admin.js" defer></script>
+</body>
+</html>
