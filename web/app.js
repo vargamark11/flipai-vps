@@ -6,10 +6,10 @@ const state = {
   currentConversationId: null,
   conversations: [],
   user: null,
+  generating: false,
 };
 
 const $ = (id) => document.getElementById(id);
-
 const authView = $("authView");
 const chatView = $("chatView");
 const loginForm = $("loginForm");
@@ -30,6 +30,10 @@ const userName = $("userName");
 const userEmail = $("userEmail");
 const chatTitle = $("chatTitle");
 const statusText = $("statusText");
+const sidebar = $("sidebar");
+const sidebarBackdrop = $("sidebarBackdrop");
+const menuBtn = $("menuBtn");
+const closeSidebarBtn = $("closeSidebarBtn");
 
 function setAuthMode(mode) {
   const isLogin = mode === "login";
@@ -84,6 +88,16 @@ async function apiFetch(path, options = {}, retry = true) {
   return response;
 }
 
+function openSidebar() {
+  sidebar.classList.add("open");
+  sidebarBackdrop.classList.remove("hidden");
+}
+
+function closeSidebar() {
+  sidebar.classList.remove("open");
+  sidebarBackdrop.classList.add("hidden");
+}
+
 function showAuth() {
   authView.classList.remove("hidden");
   chatView.classList.add("hidden");
@@ -92,6 +106,7 @@ function showAuth() {
   conversationList.innerHTML = "";
   chatTitle.textContent = "FlipAI";
   statusText.textContent = "Sign in to continue";
+  closeSidebar();
 }
 
 function showChat() {
@@ -133,8 +148,134 @@ function renderConversations() {
     const label = document.createElement("span");
     label.textContent = conversation.title || "New chat";
     button.appendChild(label);
-    button.addEventListener("click", () => openConversation(conversation.id));
+    button.addEventListener("click", async () => {
+      await openConversation(conversation.id);
+      if (window.innerWidth <= 820) closeSidebar();
+    });
     conversationList.appendChild(button);
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function inlineMarkdown(text) {
+  let safe = escapeHtml(text);
+  safe = safe.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  safe = safe.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  safe = safe.replace(/(^|\s)\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  safe = safe.replace(/(^|\s)_([^_\n]+)_/g, "$1<em>$2</em>");
+  return safe;
+}
+
+function markdownToHtml(markdown) {
+  const source = String(markdown || "").replace(/\r\n/g, "\n");
+  const codeBlocks = [];
+  let protectedText = source.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, language, code) => {
+    const index = codeBlocks.length;
+    codeBlocks.push({ language: language.trim(), code });
+    return `\n@@FLIPAI_CODE_${index}@@\n`;
+  });
+
+  const lines = protectedText.split("\n");
+  let html = "";
+  let paragraph = [];
+  let listType = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    html += `<p>${inlineMarkdown(paragraph.join("\n")).replaceAll("\n", "<br>")}</p>`;
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (!listType) return;
+    html += `</${listType}>`;
+    listType = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const codeMatch = line.trim().match(/^@@FLIPAI_CODE_(\d+)@@$/);
+    if (codeMatch) {
+      flushParagraph();
+      closeList();
+      const item = codeBlocks[Number(codeMatch[1])];
+      const lang = escapeHtml(item.language || "code");
+      html += `<pre><div class="code-header"><span>${lang}</span><button class="copy-btn" type="button">Copy</button></div><code>${escapeHtml(item.code.replace(/\n$/, ""))}</code></pre>`;
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      closeList();
+      const level = heading[1].length;
+      html += `<h${level}>${inlineMarkdown(heading[2])}</h${level}>`;
+      continue;
+    }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) {
+      flushParagraph();
+      closeList();
+      html += `<blockquote>${inlineMarkdown(quote[1])}</blockquote>`;
+      continue;
+    }
+    const unordered = line.match(/^[-*]\s+(.+)$/);
+    const ordered = line.match(/^\d+\.\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const wanted = unordered ? "ul" : "ol";
+      if (listType !== wanted) {
+        closeList();
+        listType = wanted;
+        html += `<${wanted}>`;
+      }
+      html += `<li>${inlineMarkdown((unordered || ordered)[1])}</li>`;
+      continue;
+    }
+    closeList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  closeList();
+  return html;
+}
+
+function bindCopyButtons(container) {
+  container.querySelectorAll(".copy-btn").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const code = button.closest("pre")?.querySelector("code")?.textContent || "";
+      try {
+        await navigator.clipboard.writeText(code);
+        const original = button.textContent;
+        button.textContent = "Copied";
+        setTimeout(() => (button.textContent = original), 1200);
+      } catch {
+        button.textContent = "Failed";
+      }
+    });
+  });
+}
+
+function setAssistantContent(bubble, content, streaming = false) {
+  bubble.classList.toggle("streaming-cursor", streaming);
+  if (streaming) {
+    bubble.textContent = content;
+  } else {
+    bubble.innerHTML = markdownToHtml(content);
+    bindCopyButtons(bubble);
   }
 }
 
@@ -143,7 +284,7 @@ function renderMessages(items = []) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.innerHTML = "<div><h2>How can I help?</h2><p>Start a conversation with FlipAI.</p></div>";
+    empty.innerHTML = "<div><h2>How can I help?</h2><p>Ask anything and FlipAI will answer from your own VPS.</p></div>";
     messages.appendChild(empty);
     return;
   }
@@ -152,11 +293,14 @@ function renderMessages(items = []) {
 }
 
 function appendMessage(role, content) {
+  const empty = messages.querySelector(".empty-state");
+  if (empty) empty.remove();
   const row = document.createElement("div");
   row.className = `message-row ${role === "user" ? "user" : "assistant"}`;
   const bubble = document.createElement("div");
   bubble.className = "message-bubble";
-  bubble.textContent = content;
+  if (role === "assistant") setAssistantContent(bubble, content, false);
+  else bubble.textContent = content;
   row.appendChild(bubble);
   messages.appendChild(row);
   messages.scrollTop = messages.scrollHeight;
@@ -164,6 +308,7 @@ function appendMessage(role, content) {
 }
 
 async function openConversation(id) {
+  if (state.generating) return;
   state.currentConversationId = id;
   renderConversations();
   const response = await apiFetch(`/v1/conversations/${id}`);
@@ -217,11 +362,8 @@ async function enterApp() {
     await loadMe();
     showChat();
     await loadConversations();
-    if (state.conversations.length) {
-      await openConversation(state.conversations[0].id);
-    } else {
-      renderMessages([]);
-    }
+    if (state.conversations.length) await openConversation(state.conversations[0].id);
+    else renderMessages([]);
   } catch {
     clearTokens();
     showAuth();
@@ -246,8 +388,71 @@ async function logout() {
   showAuth();
 }
 
+async function streamChat(text, assistantBubble) {
+  const response = await apiFetch("/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "flipai-v1",
+      conversation_id: state.currentConversationId,
+      messages: [{ role: "user", content: text }],
+      stream: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    try {
+      const parsed = JSON.parse(errorText);
+      throw new Error(parsed.detail || "Request failed");
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error(errorText || "Request failed");
+      throw error;
+    }
+  }
+  if (!response.body) throw new Error("Streaming is not supported by this browser");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let assistantText = "";
+  setAssistantContent(assistantBubble, "", true);
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      const lines = part.split("\n");
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const event = JSON.parse(payload);
+          const delta = event?.choices?.[0]?.delta?.content;
+          if (delta) {
+            assistantText += delta;
+            setAssistantContent(assistantBubble, assistantText, true);
+            messages.scrollTop = messages.scrollHeight;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  setAssistantContent(assistantBubble, assistantText || "No response.", false);
+  return assistantText;
+}
+
 loginTab.addEventListener("click", () => setAuthMode("login"));
 registerTab.addEventListener("click", () => setAuthMode("register"));
+menuBtn.addEventListener("click", openSidebar);
+closeSidebarBtn.addEventListener("click", closeSidebar);
+sidebarBackdrop.addEventListener("click", closeSidebar);
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -270,8 +475,10 @@ registerForm.addEventListener("submit", async (event) => {
 });
 
 newChatBtn.addEventListener("click", async () => {
+  if (state.generating) return;
   try {
     await createConversation();
+    if (window.innerWidth <= 820) closeSidebar();
   } catch (error) {
     statusText.textContent = error.message;
   }
@@ -293,6 +500,7 @@ messageInput.addEventListener("keydown", (event) => {
 
 composerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.generating) return;
   const text = messageInput.value.trim();
   if (!text) return;
   if (!state.currentConversationId) await createConversation();
@@ -300,31 +508,23 @@ composerForm.addEventListener("submit", async (event) => {
   appendMessage("user", text);
   messageInput.value = "";
   messageInput.style.height = "auto";
+  state.generating = true;
   sendBtn.disabled = true;
-  statusText.textContent = "Thinking…";
+  newChatBtn.disabled = true;
+  statusText.textContent = "Generating…";
 
   const assistantBubble = appendMessage("assistant", "");
   try {
-    const response = await apiFetch("/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "flipai-v1",
-        conversation_id: state.currentConversationId,
-        messages: [{ role: "user", content: text }],
-        stream: false,
-      }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Request failed");
-    assistantBubble.textContent = data?.choices?.[0]?.message?.content || "No response.";
+    await streamChat(text, assistantBubble);
     await Promise.all([loadCredits(), loadConversations()]);
     const selected = state.conversations.find((c) => c.id === state.currentConversationId);
     if (selected) chatTitle.textContent = selected.title || "FlipAI";
   } catch (error) {
-    assistantBubble.textContent = `Error: ${error.message}`;
+    setAssistantContent(assistantBubble, `Error: ${error.message}`, false);
   } finally {
+    state.generating = false;
     sendBtn.disabled = false;
+    newChatBtn.disabled = false;
     statusText.textContent = "Ready";
     messages.scrollTop = messages.scrollHeight;
   }
