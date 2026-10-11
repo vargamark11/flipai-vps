@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="FlipAI API", version="1.3.0")
+app = FastAPI(title="FlipAI API", version="1.4.0")
 
 PUBLIC_API_KEY = os.environ["FLIPAI_PUBLIC_API_KEY"]
 INTERNAL_API_KEY = os.environ["FLIPAI_INTERNAL_API_KEY"]
@@ -17,6 +17,8 @@ LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080/v1/chat/completio
 MODEL_ALIAS = os.environ.get("FLIPAI_MODEL_ALIAS", "flipai-v1")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://flipai:flipai@127.0.0.1:5432/flipai")
 MEMORY_LIMIT = int(os.environ.get("FLIPAI_MEMORY_LIMIT", "20"))
+STARTING_CREDITS = int(os.environ.get("FLIPAI_STARTING_CREDITS", "5000"))
+REQUESTS_PER_MINUTE = int(os.environ.get("FLIPAI_REQUESTS_PER_MINUTE", "20"))
 
 SYSTEM_PROMPT = """You are FlipAI, a fast, practical and helpful AI assistant.
 Answer in the same language as the user unless they request otherwise.
@@ -44,14 +46,19 @@ async def authenticate(authorization: str | None) -> dict:
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name FROM users WHERE api_key_hash=$1",
+            "SELECT id, name, credits FROM users WHERE api_key_hash=$1",
             hash_key(token),
         )
 
     if not row:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    return {"type": "user", "user_id": row["id"], "name": row["name"]}
+    return {
+        "type": "user",
+        "user_id": row["id"],
+        "name": row["name"],
+        "credits": row["credits"],
+    }
 
 
 def require_admin(auth: dict):
@@ -72,6 +79,9 @@ async def startup():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute(
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS credits BIGINT NOT NULL DEFAULT {STARTING_CREDITS}"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id UUID PRIMARY KEY,
@@ -90,8 +100,29 @@ async def startup():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                credits_used BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS request_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id, id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_events(user_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_created ON request_events(user_id, created_at DESC)")
 
 
 @app.on_event("shutdown")
@@ -115,7 +146,7 @@ async def health():
         "service": "flipai-api",
         "model": MODEL_ALIAS,
         "database": db_ok,
-        "version": "1.3.0",
+        "version": "1.4.0",
     }
 
 
@@ -134,17 +165,24 @@ async def create_user(request: Request, authorization: str | None = Header(defau
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
 
+    requested_credits = payload.get("credits", STARTING_CREDITS)
+    try:
+        credits = max(0, int(requested_credits))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="credits must be an integer")
+
     user_id = uuid.uuid4()
     raw_key = "flipai_user_" + secrets.token_hex(32)
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users(id, name, api_key_hash) VALUES($1,$2,$3)",
+            "INSERT INTO users(id, name, api_key_hash, credits) VALUES($1,$2,$3,$4)",
             user_id,
             name,
             hash_key(raw_key),
+            credits,
         )
 
-    return {"id": str(user_id), "name": name, "api_key": raw_key}
+    return {"id": str(user_id), "name": name, "credits": credits, "api_key": raw_key}
 
 
 @app.get("/v1/admin/users")
@@ -152,13 +190,163 @@ async def list_users(authorization: str | None = Header(default=None)):
     auth = await authenticate(authorization)
     require_admin(auth)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, created_at FROM users ORDER BY created_at DESC")
+        rows = await conn.fetch("SELECT id, name, credits, created_at FROM users ORDER BY created_at DESC")
     return {
         "data": [
-            {"id": str(r["id"]), "name": r["name"], "created_at": r["created_at"].isoformat()}
+            {
+                "id": str(r["id"]),
+                "name": r["name"],
+                "credits": r["credits"],
+                "created_at": r["created_at"].isoformat(),
+            }
             for r in rows
         ]
     }
+
+
+@app.post("/v1/admin/users/{user_id}/credits")
+async def add_credits(user_id: str, request: Request, authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    require_admin(auth)
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    payload = await request.json()
+    try:
+        amount = int(payload.get("amount", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="amount must be an integer")
+    if amount == 0:
+        raise HTTPException(status_code=400, detail="amount must not be zero")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE users SET credits=GREATEST(0, credits+$2) WHERE id=$1 RETURNING credits",
+            uid,
+            amount,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": str(uid), "credits": row["credits"]}
+
+
+@app.get("/v1/account/credits")
+async def account_credits(authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    if auth["type"] == "admin":
+        return {"type": "admin", "credits": None, "unit": "1 credit = 1 token"}
+    async with pool.acquire() as conn:
+        credits = await conn.fetchval("SELECT credits FROM users WHERE id=$1", auth["user_id"])
+    return {"user_id": str(auth["user_id"]), "credits": credits, "unit": "1 credit = 1 token"}
+
+
+@app.get("/v1/account/usage")
+async def account_usage(authorization: str | None = Header(default=None)):
+    auth = await authenticate(authorization)
+    if auth["type"] == "admin":
+        raise HTTPException(status_code=400, detail="Usage endpoint requires a user API key")
+    async with pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(prompt_tokens),0)::BIGINT AS prompt_tokens,
+                COALESCE(SUM(completion_tokens),0)::BIGINT AS completion_tokens,
+                COALESCE(SUM(total_tokens),0)::BIGINT AS total_tokens,
+                COALESCE(SUM(credits_used),0)::BIGINT AS credits_used,
+                COUNT(*)::BIGINT AS requests
+            FROM usage_events
+            WHERE user_id=$1
+            """,
+            auth["user_id"],
+        )
+        recent = await conn.fetch(
+            """
+            SELECT conversation_id, prompt_tokens, completion_tokens, total_tokens, credits_used, created_at
+            FROM usage_events
+            WHERE user_id=$1
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            auth["user_id"],
+        )
+    return {
+        "totals": dict(totals),
+        "recent": [
+            {
+                "conversation_id": str(r["conversation_id"]) if r["conversation_id"] else None,
+                "prompt_tokens": r["prompt_tokens"],
+                "completion_tokens": r["completion_tokens"],
+                "total_tokens": r["total_tokens"],
+                "credits_used": r["credits_used"],
+                "created_at": r["created_at"].isoformat(),
+            }
+            for r in recent
+        ],
+    }
+
+
+async def enforce_rate_limit(auth: dict):
+    if auth["type"] == "admin":
+        return
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM request_events WHERE user_id=$1 AND created_at < NOW() - INTERVAL '1 day'",
+                auth["user_id"],
+            )
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM request_events WHERE user_id=$1 AND created_at >= NOW() - INTERVAL '1 minute'",
+                auth["user_id"],
+            )
+            if count >= REQUESTS_PER_MINUTE:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded: {REQUESTS_PER_MINUTE} requests per minute",
+                )
+            await conn.execute("INSERT INTO request_events(user_id) VALUES($1)", auth["user_id"])
+
+
+async def require_credits(auth: dict):
+    if auth["type"] == "admin":
+        return
+    async with pool.acquire() as conn:
+        credits = await conn.fetchval("SELECT credits FROM users WHERE id=$1", auth["user_id"])
+    if credits is None or credits <= 0:
+        raise HTTPException(status_code=402, detail="Insufficient credits")
+
+
+async def record_usage(auth: dict, conversation_id: uuid.UUID, usage: dict | None):
+    if auth["type"] != "user" or not usage:
+        return
+    prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
+    completion_tokens = max(0, int(usage.get("completion_tokens", 0) or 0))
+    total_tokens = max(0, int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0))
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    credits_used = total_tokens
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO usage_events(
+                    user_id, conversation_id, prompt_tokens, completion_tokens, total_tokens, credits_used
+                ) VALUES($1,$2,$3,$4,$5,$6)
+                """,
+                auth["user_id"],
+                conversation_id,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                credits_used,
+            )
+            await conn.execute(
+                "UPDATE users SET credits=GREATEST(0, credits-$2) WHERE id=$1",
+                auth["user_id"],
+                credits_used,
+            )
 
 
 async def check_conversation_access(conversation_id: uuid.UUID, auth: dict):
@@ -333,8 +521,9 @@ def upstream_headers() -> dict:
     }
 
 
-async def stream_from_llama(upstream: dict, conversation_id: uuid.UUID):
+async def stream_from_llama(upstream: dict, conversation_id: uuid.UUID, auth: dict):
     assistant_text = ""
+    usage = None
     timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", LLAMA_URL, json=upstream, headers=upstream_headers()) as response:
@@ -355,6 +544,8 @@ async def stream_from_llama(upstream: dict, conversation_id: uuid.UUID):
                         delta = obj.get("choices", [{}])[0].get("delta", {}).get("content")
                         if delta:
                             assistant_text += delta
+                        if obj.get("usage"):
+                            usage = obj["usage"]
                     except Exception:
                         pass
                     yield (line + "\n\n").encode()
@@ -363,11 +554,14 @@ async def stream_from_llama(upstream: dict, conversation_id: uuid.UUID):
 
     if assistant_text.strip():
         await save_message(conversation_id, "assistant", assistant_text.strip())
+    await record_usage(auth, conversation_id, usage)
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request, authorization: str | None = Header(default=None)):
     auth = await authenticate(authorization)
+    await enforce_rate_limit(auth)
+    await require_credits(auth)
     payload = await request.json()
 
     incoming_messages = payload.get("messages")
@@ -380,21 +574,20 @@ async def chat(request: Request, authorization: str | None = Header(default=None
     await save_message(conversation_id, "user", user_text)
     await maybe_set_title(conversation_id, user_text)
 
-    clean_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    clean_messages.extend(history)
-    clean_messages.append({"role": "user", "content": user_text})
-
+    is_stream = bool(payload.get("stream", False))
     upstream = {
         "model": MODEL_ALIAS,
-        "messages": clean_messages,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_text}],
         "temperature": payload.get("temperature", 0.7),
         "max_tokens": payload.get("max_tokens", 512),
-        "stream": bool(payload.get("stream", False)),
+        "stream": is_stream,
     }
+    if is_stream:
+        upstream["stream_options"] = {"include_usage": True}
 
-    if upstream["stream"]:
+    if is_stream:
         return StreamingResponse(
-            stream_from_llama(upstream, conversation_id),
+            stream_from_llama(upstream, conversation_id, auth),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -421,6 +614,7 @@ async def chat(request: Request, authorization: str | None = Header(default=None
                 await save_message(conversation_id, "assistant", assistant_text)
         except Exception:
             pass
+        await record_usage(auth, conversation_id, data.get("usage"))
 
     data["conversation_id"] = str(conversation_id)
     return JSONResponse(content=data, status_code=response.status_code)
