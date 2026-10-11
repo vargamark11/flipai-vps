@@ -1,4 +1,4 @@
-const API_BASE = "https://api.flipai.cc";
+const API_BASE = "/api";
 
 const state = {
   accessToken: sessionStorage.getItem("flipai_access_token") || "",
