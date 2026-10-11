@@ -11,9 +11,11 @@ APP_DIR = Path("/opt/flipai")
 LLAMA_DIR = Path("/opt/llama.cpp")
 SERVICE_USER = "debian"
 
-def run(cmd, check=True, cwd=None):
+
+def run(cmd, check=True, cwd=None, capture=False):
     print("+", " ".join(cmd))
-    return subprocess.run(cmd, check=check, cwd=cwd)
+    return subprocess.run(cmd, check=check, cwd=cwd, text=True, capture_output=capture)
+
 
 def write(path, content, mode=0o644):
     path = Path(path)
@@ -21,14 +23,16 @@ def write(path, content, mode=0o644):
     path.write_text(content, encoding="utf-8")
     os.chmod(path, mode)
 
+
 def apt_install():
     run(["apt-get", "update"])
     run([
         "apt-get", "install", "-y",
         "git", "cmake", "build-essential", "curl",
         "libssl-dev", "pkg-config", "python3-venv",
-        "python3-pip", "caddy"
+        "python3-pip", "caddy", "postgresql", "postgresql-client"
     ])
+
 
 def build_llama():
     if not LLAMA_DIR.exists():
@@ -42,11 +46,23 @@ def build_llama():
 
     run([
         "cmake", "-S", ".", "-B", "build",
-        "-DGGML_NATIVE=ON",
-        "-DLLAMA_OPENSSL=ON"
+        "-DGGML_NATIVE=ON", "-DLLAMA_OPENSSL=ON"
     ], cwd=str(LLAMA_DIR))
-    run(["cmake", "--build", "build", "--config", "Release", "-j", str(os.cpu_count() or 2)],
-        cwd=str(LLAMA_DIR))
+    run(["cmake", "--build", "build", "--config", "Release", "-j", str(os.cpu_count() or 2)], cwd=str(LLAMA_DIR))
+
+
+def configure_postgres(db_password):
+    run(["systemctl", "enable", "--now", "postgresql"])
+    role = run(["runuser", "-u", "postgres", "--", "psql", "-tAc", "SELECT 1 FROM pg_roles WHERE rolname='flipai'"], capture=True)
+    if role.stdout.strip() != "1":
+        run(["runuser", "-u", "postgres", "--", "psql", "-c", f"CREATE USER flipai WITH PASSWORD '{db_password}'"])
+    else:
+        run(["runuser", "-u", "postgres", "--", "psql", "-c", f"ALTER USER flipai WITH PASSWORD '{db_password}'"])
+
+    db = run(["runuser", "-u", "postgres", "--", "psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname='flipai'"], capture=True)
+    if db.stdout.strip() != "1":
+        run(["runuser", "-u", "postgres", "--", "createdb", "-O", "flipai", "flipai"])
+
 
 def install_backend():
     APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,19 +71,24 @@ def install_backend():
         shutil.copy2(src / name, APP_DIR / name)
 
     venv = APP_DIR / ".venv"
-    run(["python3", "-m", "venv", str(venv)])
+    if not venv.exists():
+        run(["python3", "-m", "venv", str(venv)])
     run([str(venv / "bin" / "pip"), "install", "--upgrade", "pip"])
     run([str(venv / "bin" / "pip"), "install", "-r", str(APP_DIR / "requirements.txt")])
 
-def create_env(domain, model_repo, model_alias, public_api_key, internal_api_key):
+
+def create_env(domain, model_repo, model_alias, public_api_key, internal_api_key, db_password):
     env = f"""FLIPAI_DOMAIN={domain}
 FLIPAI_MODEL_REPO={model_repo}
 FLIPAI_MODEL_ALIAS={model_alias}
 FLIPAI_PUBLIC_API_KEY={public_api_key}
 FLIPAI_INTERNAL_API_KEY={internal_api_key}
 LLAMA_URL=http://127.0.0.1:8080/v1/chat/completions
+DATABASE_URL=postgresql://flipai:{db_password}@127.0.0.1:5432/flipai
+FLIPAI_MEMORY_LIMIT=20
 """
     write("/etc/flipai.env", env, 0o600)
+
 
 def create_services(model_repo, model_alias):
     llama_service = f"""[Unit]
@@ -90,7 +111,7 @@ WantedBy=multi-user.target
 """
     api_service = f"""[Unit]
 Description=FlipAI Python API
-After=network-online.target flipai-model.service
+After=network-online.target postgresql.service flipai-model.service
 Requires=flipai-model.service
 
 [Service]
@@ -109,6 +130,7 @@ WantedBy=multi-user.target
     write("/etc/systemd/system/flipai-model.service", llama_service)
     write("/etc/systemd/system/flipai-api.service", api_service)
 
+
 def configure_caddy(domain):
     caddyfile = f"""{domain} {{
     encode zstd gzip
@@ -118,12 +140,15 @@ def configure_caddy(domain):
     write("/etc/caddy/Caddyfile", caddyfile)
     run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
 
+
 def enable_services():
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "flipai-model.service"])
     run(["systemctl", "enable", "--now", "flipai-api.service"])
     run(["systemctl", "enable", "--now", "caddy"])
+    run(["systemctl", "restart", "flipai-api"])
     run(["systemctl", "restart", "caddy"])
+
 
 def main():
     if os.geteuid() != 0:
@@ -139,11 +164,13 @@ def main():
 
     public_key = args.public_api_key or ("flipai_pk_" + secrets.token_hex(32))
     internal_key = "flipai_internal_" + secrets.token_hex(32)
+    db_password = secrets.token_hex(24)
 
     apt_install()
     build_llama()
+    configure_postgres(db_password)
     install_backend()
-    create_env(args.domain, args.model_repo, args.model_alias, public_key, internal_key)
+    create_env(args.domain, args.model_repo, args.model_alias, public_key, internal_key, db_password)
     create_services(args.model_repo, args.model_alias)
     configure_caddy(args.domain)
     enable_services()
@@ -152,15 +179,9 @@ def main():
     print("Domain:", f"https://{args.domain}")
     print("Model:", args.model_alias)
     print("Public API key:", public_key)
+    print("Conversation memory: PostgreSQL enabled")
     print("\nIMPORTANT: save the public API key now.")
-    print("Health:", f"curl https://{args.domain}/health")
-    print("\nTest:")
-    print(
-        f"""curl https://{args.domain}/v1/chat/completions \\
-  -H 'Authorization: Bearer {public_key}' \\
-  -H 'Content-Type: application/json' \\
-  -d '{{"model":"{args.model_alias}","messages":[{{"role":"user","content":"Szia! Ki vagy te?"}}]}}'"""
-    )
+
 
 if __name__ == "__main__":
     main()
